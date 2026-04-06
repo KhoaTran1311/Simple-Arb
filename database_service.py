@@ -1,31 +1,30 @@
 import logging
-import sqlite3
 from datetime import datetime
+
+import aiosqlite
 
 from models import Pair, BidAsk
 
-db_logger = logging.getLogger("db")
+logger = logging.getLogger(__name__)
 
 
 class DatabaseService:
     def __init__(self, db_path=None):
         self.db_path = db_path
-        self.connection = None
-        self._initialize_db()
+        self.db_conn = None
 
-    def _get_connection(self):
-        return sqlite3.connect(self.db_path)
+    async def initialize_db(self):
+        self.db_conn = await aiosqlite.connect(self.db_path)
 
-    def _initialize_db(self):
         query = """
                 CREATE TABLE IF NOT EXISTS pair
                 (
                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
                     first_exchange  TEXT,
                     second_exchange TEXT,
-                    first_id        TEXT,
-                    second_id       TEXT,
-                    UNIQUE (first_exchange, second_exchange, first_id, second_id)
+                    first_ticker    TEXT,
+                    second_ticker   TEXT,
+                    UNIQUE (first_exchange, second_exchange, first_ticker, second_ticker)
                 );
 
                 CREATE TABLE IF NOT EXISTS bid_ask
@@ -48,61 +47,53 @@ class DatabaseService:
                     long_exchange TEXT
                 )
                 """
-        with self._get_connection() as conn:
-            db_logger.debug(f"Initializing up database")
-            conn.executescript(query)
+        await self.db_conn.executescript(query)
+        await self.db_conn.commit()
+        logger.info(f"Initialized database")
 
-    def get_or_create_pair(self, first_exchange: str, second_exchange, first_id: str, second_id: str):
-        db_logger.debug(f"Get/Create pair for [{first_exchange}]{first_id} –– [{second_exchange}]{second_id}")
+    async def get_or_create_pair(self, first_exchange: str, second_exchange, first_ticker: str, second_ticker: str):
+        logger.debug(f"Get/Create pair for [{first_exchange}]{first_ticker} –– [{second_exchange}]{second_ticker}")
 
-        with self._get_connection() as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                        SELECT *
-                        FROM pair
-                        WHERE first_exchange = ?
-                          AND second_exchange = ?
-                          AND first_id = ?
-                          AND second_id = ?
-                        """, (first_exchange, second_exchange, first_id, second_id))
-            row = cur.fetchone()
-            if row:
-                db_logger.debug(f"Found existing pair with id: {row[0]}")
-                market_pair = Pair(*row)
-                db_logger.debug(f"Found pair: {market_pair}")
-                return market_pair
+        await self.db_conn.execute("""
+                                   INSERT OR IGNORE INTO pair (first_exchange, second_exchange, first_ticker, second_ticker)
+                                   VALUES (?, ?, ?, ?)
+                                   """, (first_exchange, second_exchange, first_ticker, second_ticker))
+        await self.db_conn.commit()
+        async with self.db_conn.execute("""
+                                        SELECT *
+                                        FROM pair
+                                        WHERE first_exchange = ?
+                                          AND second_exchange = ?
+                                          AND first_ticker = ?
+                                          AND second_ticker = ?
+                                        """, (first_exchange, second_exchange, first_ticker, second_ticker)) as cur:
+            row = await cur.fetchone()
 
-            cur.execute("""
-                        INSERT INTO pair (first_exchange, second_exchange, first_id, second_id)
-                        VALUES (?, ?, ?, ?)
-                        """, (first_exchange, second_exchange, first_id, second_id))
-
-            pair_id = cur.lastrowid
-            db_logger.debug(f"Created new pair id: {pair_id}")
-            return Pair(pair_id, first_exchange, second_exchange, first_id, second_id)
-
+        return Pair(*row)
 
     async def save_bid_ask(self, pair_id: int, bid_ask: BidAsk):
-        db_logger.debug(f"Save bid and ask for pair {pair_id}, value: {bid_ask}")
-        with self._get_connection() as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                        INSERT INTO bid_ask (exchange, bid, ask, timestamp, pair_id)
-                        VALUES (?, ?, ?, ?, ?)
-                        """, (bid_ask.exchange, bid_ask.bid, bid_ask.ask, int(bid_ask.timestamp), pair_id))
-            conn.close()
-            db_logger.debug(f"Finished saving {bid_ask}")
+        logger.debug(f"Save bid and ask for pair {pair_id}, value: {bid_ask}")
 
+        await self.db_conn.execute("""
+                                   INSERT INTO bid_ask (pair_id, exchange, bid, ask, timestamp)
+                                   VALUES (?, ?, ?, ?, ?)
+                                   """, (pair_id, bid_ask.exchange, bid_ask.bid, bid_ask.ask, int(bid_ask.timestamp)))
+        await self.db_conn.commit()
+        logger.info(f"Finished saving bid ask")
 
-    def save_signal(self, pair_id: int, long_price: float, short_price: float, long_exchange: str):
-        db_logger.debug(f"Saving signal for pair {pair_id}, long_price={long_price}, short_price={short_price}, long_exchange={long_exchange}")
-        with self._get_connection() as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                        INSERT INTO signal (pair_id, timestamp, long_price, short_price, long_exchange)
-                        VALUES (?, ?, ?, ?, ?)
-                        """, (pair_id, int(datetime.now().timestamp()), long_price, short_price, long_exchange))
-            conn.close()
-            db_logger.debug(f"Finished saving signal")
+    async def save_signal(self, pair_id: int, long_price: float, short_price: float, long_exchange: str):
+        logger.debug(
+            f"Saving signal for pair {pair_id}, long_price={long_price}, short_price={short_price}, long_exchange={long_exchange}")
 
+        await self.db_conn.execute("""
+                                   INSERT INTO signal (pair_id, timestamp, long_price, short_price, long_exchange)
+                                   VALUES (?, ?, ?, ?, ?)
+                                   """,
+                                   (pair_id, int(datetime.now().timestamp()), long_price, short_price, long_exchange))
+        await self.db_conn.commit()
+        logger.info(f"Finished saving signal")
 
+    async def close_db(self):
+        if self.db_conn:
+            await self.db_conn.close()
+            logger.info(f"Closed database connection")

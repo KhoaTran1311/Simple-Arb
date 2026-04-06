@@ -3,206 +3,151 @@ import json
 import logging
 
 import websockets
-from websockets.client import ClientConnection
-
 from gen_auth_headers import gen_kalshi_auth_headers
 
-kalshi_logger = logging.getLogger("kalshi")
-polymarket_logger = logging.getLogger("polymarket")
+
+class BaseWebsocketManager:
+    url = None
+
+    def __init__(self, logger_name=__name__):
+        self.logger = logging.getLogger(logger_name)
+        self.websocket = None
+        self.is_subscribed = False
+        self.is_connected = False
+
+    def _get_additional_headers(self):
+        return None
+
+    async def connect(self):
+        if self.url is None:
+            raise NotImplementedError("Must implement url in subclass")
+
+        try:
+            self.websocket = await websockets.connect(self.url, additional_headers=self._get_additional_headers())
+
+            self.is_connected = True
+            self.logger.info(f"Connected")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to connect: {e}")
+            self.is_connected = False
+            return False
+
+    def _get_subscribe_message(self):
+        raise NotImplementedError("Must implement subscribe in subclass")
+
+    async def subscribe(self):
+        if not self.is_connected:
+            return False
+
+        try:
+            subscribe_message = self._get_subscribe_message()
+            self.logger.debug(f"Sending subscribe message: {subscribe_message}")
+            await self.websocket.send(json.dumps(subscribe_message))
+            self.is_subscribed = True
+            self.logger.info(f"Subscribed")
+            return True
+        except Exception as e:
+            self.logger.error(f"{e}")
+            self.is_subscribed = False
+            return False
+
+    async def _get_unsubscribe_message(self):
+        raise NotImplementedError("Must implement _get_unsubscribe_message in subclass")
+
+    async def unsubscribe(self):
+        if not self.is_subscribed:
+            self.logger.warning("Already unsubscribed, skipping")
+            return
+
+        try:
+            unsubscribe_message = await self._get_unsubscribe_message()
+            self.logger.debug(f"Sending unsubscribe message: {unsubscribe_message}")
+            await self.websocket.send(json.dumps(unsubscribe_message))
+            await asyncio.sleep(0.1)  # Wait for server to process
+            self.is_subscribed = False
+            self.logger.info(f"Unsubscribed")
+        except websockets.exceptions.ConnectionClosed:
+            self.logger.warning(f"WebSocket already closed, cannot unsubscribe")
+        except Exception as e:
+            self.logger.error(f"Failed to unsubscribe: {e}")
+
+    async def get_message(self):
+        if not self.websocket:
+            return None
+
+        try:
+            message = await self.websocket.recv()
+            return json.loads(message)
+        except websockets.exceptions.ConnectionClosed:
+            self.is_connected = False
+            self.logger.error(f"WebSocket already closed")
+            return None
+        except Exception as e:
+            self.logger.error(f"Failed to get message: {e}")
+            return None
+
+    async def close(self):
+        self.logger.debug(f"Closing WebSocket")
+        if not self.websocket or not self.is_connected:
+            self.logger.warning(f"WebSocket already closed")
+            return
+
+        await self.unsubscribe()
+
+        try:
+            await self.websocket.close()
+            self.is_connected = False
+            self.logger.info(f"WebSocket closed")
+        except websockets.exceptions.ConnectionClosed:
+            self.logger.warning(f"WebSocket already closed")
+        except Exception as e:
+            self.logger.error(f"{e}")
+
+    async def __aenter__(self):
+        if not await self.connect():
+            raise ConnectionError("Failed to connect to WebSocket")
+        await self.subscribe()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self.logger.warning(f"Exiting (exc_type={exc_type}, exc_val='{exc_val}')")
+        await self.close()
 
 
-class KalshiWebsocketManager:
-    KALSHI_WS_BASE_URL = "wss://api.elections.kalshi.com"
-    KALSHI_WS_PATH = "/trade-api/ws/v2"
+class KalshiWebsocketManager(BaseWebsocketManager):
+    base_url = "wss://api.elections.kalshi.com"
+    path = "/trade-api/ws/v2"
+    url = base_url + path
 
     def __init__(self, market_ticker):
-        self.websocket = None
-        self.is_connected = False
-        self.is_subscribed = False
+        super().__init__("KalshiWbsckt")
+        self.logger.debug(f"Initializing KalshiWebsocketManager with market ticker: {market_ticker}")
         self.market_ticker = market_ticker
 
-    async def connect(self):
-        try:
-            self.websocket = await websockets.connect(self.KALSHI_WS_BASE_URL + self.KALSHI_WS_PATH,
-                additional_headers=gen_kalshi_auth_headers("GET", self.KALSHI_WS_PATH))
+    def _get_additional_headers(self):
+        return gen_kalshi_auth_headers("GET", self.path)
 
-            self.is_connected = True
-            kalshi_logger.info(msg=f"Connected")
-            return True
-        except Exception as e:
-            kalshi_logger.error(f"Failed to connect: {e}")
-            self.is_connected = False
-            return False
+    def _get_subscribe_message(self):
+        return {"id": 1, "cmd": "subscribe",
+                "params": {"channels": ["ticker"], "market_ticker": self.market_ticker}}
 
-    async def subscribe(self):
-        if not self.is_connected:
-            return False
-
-        try:
-            subscribe_msg = {"id": 1, "cmd": "subscribe",
-                             "params": {"channels": ["ticker"], "market_ticker": self.market_ticker}}
-            await self.websocket.send(json.dumps(subscribe_msg))
-            self.is_subscribed = True
-            kalshi_logger.info(msg=f"Subscribed")
-            return True
-        except Exception as e:
-            kalshi_logger.error(f"Failed to subscribe: {e}")
-            self.is_subscribed = False
-            return False
-
-    async def unsubscribe(self):
-        kalshi_logger.debug(msg=f"Unsubscribing")
-        if not self.is_subscribed:
-            return
-
-        try:
-            unsubscribe_msg = {"id": 1, "cmd": "unsubscribe",
+    def _get_unsubscribe_message(self):
+        return {"id": 1, "cmd": "unsubscribe",
                                "params": {"channels": ["ticker"], "market_ticker": self.market_ticker}}
-            kalshi_logger.debug(msg=f"Sending unsubscribe message")
-            await self.websocket.send(json.dumps(unsubscribe_msg))
-            await asyncio.sleep(0.1)  # Wait for server to process
-            self.is_subscribed = False
-            kalshi_logger.info(msg=f"Unsubscribed")
-        except websockets.exceptions.ConnectionClosed:
-            polymarket_logger.warning(f"WebSocket already closed, cannot unsubscribe")
-        except Exception as e:
-            kalshi_logger.error(f"Failed to unsubscribe: {e}")
-
-    async def get_message(self):
-        if not self.websocket:
-            return None
-
-        try:
-            message = await self.websocket.recv()
-            return json.loads(message)
-        except asyncio.TimeoutError:
-            kalshi_logger.warning(msg=f"Timeout while waiting for message")
-            return None
-        except websockets.exceptions.ConnectionClosed:
-            kalshi_logger.error(f"WebSocket already closed")
-        except Exception as e:
-            kalshi_logger.error(f"Failed to get message: {e}")
-            return None
-
-    async def close(self):
-        kalshi_logger.debug(msg=f"Closing WebSocket")
-        if not self.websocket:
-            kalshi_logger.warning(f"WebSocket already closed")
-            return
-
-        await self.unsubscribe()
-
-        try:
-            await self.websocket.close()
-            self.is_connected = False
-            kalshi_logger.info(msg=f"WebSocket closed")
-        except websockets.exceptions.ConnectionClosed:
-            kalshi_logger.warning(f"WebSocket already closed")
-        except Exception as e:
-            kalshi_logger.error(f"Failed to close WebSocket: {e}")
-
-    async def __aenter__(self):
-        await self.connect()
-        await self.subscribe()
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        kalshi_logger.warning(msg=f"Exiting (exc_type={exc_type})")
-        await self.close()
 
 
-class PolymarketWebsocketManager:
-    POLYMARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+class PolymarketWebsocketManager(BaseWebsocketManager):
+    url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
     def __init__(self, assets_id):
-        self.websocket: None | ClientConnection = None
-        self.is_connected = False
-        self.is_subscribed = False
+        super().__init__("PolyWbsckt")
+        self.logger.debug(f"Initializing PolymarketWebsocktManager with asset id: {assets_id}")
         self.assets_id = assets_id
 
-    async def connect(self):
-        try:
-            self.websocket = await websockets.connect(self.POLYMARKET_WS_URL)
-            self.is_connected = True
-            polymarket_logger.info(msg=f"Connected")
-            return True
-        except Exception as e:
-            polymarket_logger.error(f"Failed to connect: {e}")
-            self.is_connected = False
-            return False
+    def _get_subscribe_message(self):
+        return {"assets_ids": [self.assets_id], "type": "market", "custom_feature_enabled": True,
+                "initial_dump": False}
 
-    async def subscribe(self):
-        if not self.is_connected:
-            return False
-
-        try:
-            subscribe_msg = {"assets_ids": [self.assets_id], "type": "market", "custom_feature_enabled": True,
-                             "initial_dump": False}
-            await self.websocket.send(json.dumps(subscribe_msg))
-            self.is_subscribed = True
-            polymarket_logger.info(msg=f"Subscribed")
-            return True
-        except Exception as e:
-            polymarket_logger.error(f"Failed to subscribe: {e}")
-            self.is_subscribed = False
-            return False
-
-    async def unsubscribe(self):
-        polymarket_logger.debug(msg=f"Unsubscribing")
-        if not self.is_subscribed:
-            return
-
-        try:
-            unsubscribe_msg = {"operation": "unsubscribe", "assets_ids": [self.assets_id], }
-            polymarket_logger.debug(msg=f"Sending unsubscribe message")
-            await self.websocket.send(json.dumps(unsubscribe_msg))
-            await asyncio.sleep(0.1)  # Wait for server to process
-            self.is_subscribed = False
-            polymarket_logger.info(msg=f"Sending unsubscribe message")
-        except websockets.exceptions.ConnectionClosed:
-            polymarket_logger.warning(f"WebSocket already closed, cannot unsubscribe")
-            self.is_subscribed = False
-        except Exception as e:
-            polymarket_logger.error(f"Failed to unsubscribe: {e}")
-
-    async def get_message(self):
-        if not self.websocket:
-            return None
-
-        try:
-            message = await self.websocket.recv()
-            return json.loads(message)
-        except asyncio.TimeoutError:
-            polymarket_logger.warning(msg=f"Timeout while waiting for message")
-            return None
-        except websockets.exceptions.ConnectionClosed:
-            polymarket_logger.error(f"WebSocket already closed")
-        except Exception as e:
-            polymarket_logger.error(f"Failed to get message: {e}")
-            return None
-
-    async def close(self):
-        polymarket_logger.debug(msg=f"Closing WebSocket")
-        if not self.websocket:
-            polymarket_logger.warning(f"WebSocket already closed")
-            return
-
-        await self.unsubscribe()
-
-        try:
-            await self.websocket.close()
-            self.is_connected = False
-            polymarket_logger.info(msg=f"WebSocket closed")
-        except websockets.exceptions.ConnectionClosed:
-            polymarket_logger.warning(f"WebSocket already closed")
-        except Exception as e:
-            polymarket_logger.error(f"Failed to close WebSocket: {e}")
-
-    async def __aenter__(self):
-        await self.connect()
-        await self.subscribe()
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        polymarket_logger.warning(msg=f"Exiting (exc_type={exc_type})")
-        await self.close()
+    def _get_unsubscribe_message(self):
+        return {"operation": "unsubscribe", "assets_ids": [self.assets_id], }

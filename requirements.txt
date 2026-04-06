@@ -1,0 +1,7 @@
+aiosqlite==0.22.1
+cffi==2.0.0
+cryptography==46.0.6
+dotenv==0.9.9
+pycparser==3.0
+python-dotenv==1.2.2
+websockets==16.0
