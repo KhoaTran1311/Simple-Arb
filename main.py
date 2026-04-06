@@ -1,48 +1,22 @@
 import argparse
 import asyncio
 import logging
-import sqlite3
-from dataclasses import dataclass
 from datetime import datetime
 
+from database_service import DatabaseService
+from models import BidAsk, Pair
 from ws_managers import KalshiWebsocketManager, PolymarketWebsocketManager
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s: [%(levelname)s] %(message)s',
-                    filename='./logs/app.log', filemode='a')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] -- %(name)s/%(funcName)s::%(lineno)d -- %(message)s',
+                    filename='./logs/app.log', filemode='a', datefmt="%m/%d/%y %H:%M:%S")
 
 kalshi_logger = logging.getLogger("kalshi")
 polymarket_logger = logging.getLogger("polymarket")
 compare_logger = logging.getLogger("compare")
 main_logger = logging.getLogger("main")
-db_logger = logging.getLogger("db")
-
-# KALSHI_MARKET_TICKER = "KXNETFLIXRANKMOVIEGLOBAL-26APR06-PEA"  # "KXMARMAD-26-MICH"
-# POLYMARKET_ASSET_ID = "11785106817903298677191578728525104664238359853143441532746222418350223391909"  # "104731530598978202925563656323694933154318837341770296468059903473029914991939"
 
 
-@dataclass
-class BidAsk:
-    exchange: str
-    bid: float
-    ask: float
-    timestamp: float
-
-    def __str__(self):
-        return f"BidAsk(exchange={self.exchange}, bid={self.bid}, ask={self.ask}, timestamp={self.timestamp})"
-
-@dataclass
-class Pair:
-    id: int
-    first_exchange: str
-    second_exchange: str
-    first_id: str
-    second_id: str
-
-    def __str__(self):
-        return f"Pair([{self.first_exchange}] {self.first_id}, [{self.second_exchange}] {self.second_id})"
-
-
-async def kalshi_websocket(market_pair: Pair, queue: asyncio.Queue):
+async def kalshi_websocket(db_service: DatabaseService, market_pair: Pair, queue: asyncio.Queue):
     kalshi_logger.debug(msg=f"Starting Kalshi websocket task with market ticker: {market_pair.first_exchange}")
     try:
         async with KalshiWebsocketManager(market_pair.first_exchange) as manager:
@@ -57,7 +31,7 @@ async def kalshi_websocket(market_pair: Pair, queue: asyncio.Queue):
                     bid_ask = BidAsk(exchange="Kalshi", bid=float(data["msg"]["yes_bid_dollars"]),
                                      ask=float(data["msg"]["yes_ask_dollars"]), timestamp=datetime.now().timestamp())
                     await queue.put(bid_ask)
-                    await save_bid_ask_to_db(bid_ask, market_pair.id)
+                    await db_service.save_bid_ask(market_pair.id, bid_ask)
 
                 elif msg_type == "error":
                     kalshi_logger.error(data)
@@ -70,7 +44,7 @@ async def kalshi_websocket(market_pair: Pair, queue: asyncio.Queue):
         raise
 
 
-async def polymarket_websocket(market_pair: Pair, queue: asyncio.Queue):
+async def polymarket_websocket(db_service: DatabaseService, market_pair: Pair, queue: asyncio.Queue):
     polymarket_logger.debug(msg=f"Starting Polymarket websocket task with market ticker: {market_pair.second_id}")
     try:
         async with PolymarketWebsocketManager(market_pair.second_id) as manager:
@@ -85,7 +59,7 @@ async def polymarket_websocket(market_pair: Pair, queue: asyncio.Queue):
                     bid_ask = BidAsk(exchange="Polymarket", bid=float(data["best_bid"]), ask=float(data["best_ask"]),
                                      timestamp=datetime.now().timestamp())
                     await queue.put(bid_ask)
-                    await save_bid_ask_to_db(bid_ask, market_pair.id)
+                    await db_service.save_bid_ask(market_pair.id, bid_ask)
 
                 elif msg_type == "error":
                     polymarket_logger.error(data)
@@ -98,21 +72,7 @@ async def polymarket_websocket(market_pair: Pair, queue: asyncio.Queue):
         raise
 
 
-async def make_trade(kalshi: BidAsk, polymarket: BidAsk, is_first_long: bool, pair_id: int):
-    compare_logger.info(f"Executing trade: {kalshi}, {polymarket}, is_first_long={is_first_long}")
-    if is_first_long:
-        long_price = kalshi.ask
-        short_price = polymarket.bid
-        long_exchange = "Kalshi"
-    else:
-        long_price = polymarket.ask
-        short_price = kalshi.bid
-        long_exchange = "Polymarket"
-
-    await save_trade_to_db(long_price, short_price, long_exchange, pair_id)
-
-
-async def compare_exchanges(pair_id: int, queue, threshold=0.01):
+async def compare_exchanges(db_service: DatabaseService, pair_id: int, queue, threshold=0.01):
     compare_logger.debug(f"Running with threshold: {threshold}")
     kalshi = None
     polymarket = None
@@ -128,21 +88,29 @@ async def compare_exchanges(pair_id: int, queue, threshold=0.01):
                 kalshi_long = polymarket.bid - kalshi.ask
                 poly_long = kalshi.bid - polymarket.ask
 
-                if kalshi_long > threshold:
-                    await make_trade(kalshi, polymarket, is_first_long=True, pair_id=pair_id)
-                if poly_long > threshold:
-                    await make_trade(kalshi, polymarket, is_first_long=False, pair_id=pair_id)
+                if kalshi_long > threshold or poly_long > threshold:
+                    compare_logger.info(f"Arbitrage opportunity found")
+                    if kalshi_long > threshold:
+                        long_price = kalshi.ask
+                        short_price = polymarket.bid
+                        long_exchange = "Kalshi"
+                    else:
+                        long_price = polymarket.ask
+                        short_price = kalshi.bid
+                        long_exchange = "Polymarket"
+
+                    db_service.save_signal(pair_id, long_price, short_price, long_exchange)
 
     except asyncio.CancelledError:
         compare_logger.warning("Task cancelled")
         raise
 
 
-async def main(market_pair: Pair):
+async def main(db_service, market_pair):
     queue = asyncio.Queue()
-    tasks = [asyncio.create_task(kalshi_websocket(market_pair, queue)),
-             asyncio.create_task(polymarket_websocket(market_pair, queue)),
-             asyncio.create_task(compare_exchanges(market_pair.id, queue, threshold=0))]
+    tasks = [asyncio.create_task(kalshi_websocket(db_service, market_pair, queue)),
+             asyncio.create_task(polymarket_websocket(db_service, market_pair, queue)),
+             asyncio.create_task(compare_exchanges(db_service, market_pair.id, queue, threshold=0))]
 
     try:
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
@@ -165,102 +133,6 @@ async def main(market_pair: Pair):
         main_logger.info("Cleaned up")
 
 
-def setup_db():
-    db_logger.debug(f"Setting up database")
-    con = sqlite3.connect("prices.db")
-    cur = con.cursor()
-
-    cur.execute("""
-                CREATE TABLE IF NOT EXISTS pair
-                (
-                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                    first_exchange  TEXT,
-                    second_exchange TEXT,
-                    first_id        TEXT,
-                    second_id       TEXT,
-                    UNIQUE (first_exchange, second_exchange, first_id, second_id)
-                )
-                """)  # NOTE: ids are stored as either Polymarket asset IDs or Kalshi market tickers, depending on the exchange. This is basically the exchange's identifier for the market.
-
-    cur.execute("""
-                CREATE TABLE IF NOT EXISTS bid_ask
-                (
-                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                    pair_id   INTEGER REFERENCES pair (id),
-                    exchange  TEXT,
-                    bid       REAL,
-                    ask       REAL,
-                    timestamp INTEGER
-                )
-                """)
-
-    cur.execute("""
-                CREATE TABLE IF NOT EXISTS signal
-                (
-                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                    pair_id       INTEGER REFERENCES pair (id),
-                    timestamp     INTEGER,
-                    long_price    REAL,
-                    short_price   REAL,
-                    long_exchange TEXT
-                )
-                """)
-
-    con.commit()
-    con.close()
-    db_logger.debug(f"Finished setting up database")
-
-
-async def save_trade_to_db(long_price: float, short_price: float, long_exchange: str, pair_id: int):
-    db_logger.debug(f"Saving trade: long_price={long_price}, short_price={short_price}, long_exchange={long_exchange}")
-    con = sqlite3.connect("prices.db")
-    cur = con.cursor()
-    cur.execute("""
-                INSERT INTO signal (timestamp, long_price, short_price, long_exchange, pair_id)
-                VALUES (?, ?, ?, ?, ?)
-                """, (int(datetime.now().timestamp()), long_price, short_price, long_exchange), pair_id)
-    con.commit()
-    con.close()
-    db_logger.debug(f"Finished saving trade")
-
-
-async def save_bid_ask_to_db(bid_ask: BidAsk, pair_id: int):
-    db_logger.debug(f"Saving {bid_ask}")
-    con = sqlite3.connect("prices.db")
-    cur = con.cursor()
-    cur.execute("""
-                INSERT INTO bid_ask (exchange, bid, ask, timestamp, pair_id)
-                VALUES (?, ?, ?, ?, ?)
-                """, (bid_ask.exchange, bid_ask.bid, bid_ask.ask, int(bid_ask.timestamp), pair_id))
-    con.commit()
-    con.close()
-    db_logger.debug(f"Finished saving {bid_ask}")
-
-
-def get_pair_id(kalshi_ticker: str, poly_asset_id: str):
-    db_logger.debug(f"Getting pair id for {kalshi_ticker} - {poly_asset_id}")
-    con = sqlite3.connect("prices.db")
-    cur = con.cursor()
-
-    cur.execute("""
-                SELECT * FROM pair 
-                WHERE first_exchange = 'Kalshi' AND second_exchange = 'Polymarket' AND first_id = ? AND second_id = ?
-                """, (kalshi_ticker, poly_asset_id)) # TODO: hardcoded exchange
-    row = cur.fetchone()
-    if row:
-        market_pair = Pair(*row)
-        db_logger.debug(f"Found pair: {market_pair}")
-        return market_pair
-    cur.execute("""
-                INSERT INTO pair (first_exchange, second_exchange, first_id, second_id)
-                VALUES ('Kalshi', 'Polymarket', ?, ?)
-                """, (kalshi_ticker, poly_asset_id)) # TODO: hardcoded exchange
-    con.commit()
-    pair_id = cur.lastrowid
-    db_logger.debug(f"Created new pair id: {pair_id}")
-    return Pair(pair_id, 'Kalshi', 'Polymarket', kalshi_ticker, poly_asset_id)
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="simple arb")
 
@@ -269,6 +141,6 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    setup_db() # TODO: DI for db connection
-    market_pair = get_pair_id(args.kalshi_ticker, args.poly_asset_id)
-    asyncio.run(main(market_pair))
+    db_service = DatabaseService("prices.db")
+    market_pair = db_service.get_or_create_pair("Kalshi", "Polymarket", args.kalshi_ticker, args.poly_asset_id)
+    asyncio.run(main(db_service, market_pair))
