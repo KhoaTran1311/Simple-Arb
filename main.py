@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import logging
 import sqlite3
@@ -5,7 +6,8 @@ from datetime import datetime
 
 from ws_managers import KalshiWebsocketManager, PolymarketWebsocketManager
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s: [%(levelname)s] %(message)s')
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s: [%(levelname)s] %(message)s',
+                    filename='./logs/app.log', filemode='a')
 
 kalshi_logger = logging.getLogger("kalshi")
 polymarket_logger = logging.getLogger("polymarket")
@@ -13,8 +15,8 @@ compare_logger = logging.getLogger("compare")
 main_logger = logging.getLogger("main")
 db_logger = logging.getLogger("db")
 
-KALSHI_MARKET_TICKER = "KXMARMAD-26-MICH"
-POLYMARKET_ASSET_ID = "104731530598978202925563656323694933154318837341770296468059903473029914991939"
+# KALSHI_MARKET_TICKER = "KXNETFLIXRANKMOVIEGLOBAL-26APR06-PEA"  # "KXMARMAD-26-MICH"
+# POLYMARKET_ASSET_ID = "11785106817903298677191578728525104664238359853143441532746222418350223391909"  # "104731530598978202925563656323694933154318837341770296468059903473029914991939"
 
 
 class BidAsk:
@@ -28,9 +30,10 @@ class BidAsk:
         return f"BidAsk(exchange={self.exchange}, bid={self.bid}, ask={self.ask}, timestamp={self.timestamp})"
 
 
-async def kalshi_websocket(queue: asyncio.Queue):
+async def kalshi_websocket(ticker, queue: asyncio.Queue):
+    kalshi_logger.debug(msg=f"Starting Kalshi websocket task with market ticker: {ticker}")
     try:
-        async with KalshiWebsocketManager(KALSHI_MARKET_TICKER) as manager:
+        async with KalshiWebsocketManager(ticker) as manager:
             while True:
                 data = await manager.get_message()
                 if data is None:
@@ -55,9 +58,10 @@ async def kalshi_websocket(queue: asyncio.Queue):
         raise
 
 
-async def polymarket_websocket(queue: asyncio.Queue):
+async def polymarket_websocket(asset_id, queue: asyncio.Queue):
+    polymarket_logger.debug(msg=f"Starting Polymarket websocket task with market ticker: {asset_id}")
     try:
-        async with PolymarketWebsocketManager(POLYMARKET_ASSET_ID) as manager:
+        async with PolymarketWebsocketManager(asset_id) as manager:
             while True:
                 data = await manager.get_message()
                 if data is None:
@@ -114,19 +118,18 @@ async def compare_exchanges(queue, threshold=0.01):
 
                 if kalshi_long > threshold:
                     await make_trade(kalshi, polymarket, is_first_long=True)
-                    print(f"LK_SP: {kalshi_long}")
                 if poly_long > threshold:
                     await make_trade(kalshi, polymarket, is_first_long=False)
-                    print(f"LP_SK: {poly_long}")
 
     except asyncio.CancelledError:
         compare_logger.warning("Task cancelled")
         raise
 
 
-async def main():
+async def main(kalshi_ticker: str, poly_asset_id: str):
     queue = asyncio.Queue()
-    tasks = [asyncio.create_task(kalshi_websocket(queue)), asyncio.create_task(polymarket_websocket(queue)),
+    tasks = [asyncio.create_task(kalshi_websocket(kalshi_ticker, queue)),
+             asyncio.create_task(polymarket_websocket(poly_asset_id, queue)),
              asyncio.create_task(compare_exchanges(queue, threshold=0))]
 
     try:
@@ -207,5 +210,12 @@ async def save_bid_ask_to_db(bid_ask: BidAsk):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="simple arb")
+
+    parser.add_argument("kalshi_ticker", type=str, help="Kalshi market ticker")
+    parser.add_argument("poly_asset_id", type=str, help="Polymarket asset ID (found in clobTokenIds)")
+
+    args = parser.parse_args()
+
     setup_db()
-    asyncio.run(main())
+    asyncio.run(main(args.kalshi_ticker, args.poly_asset_id))
