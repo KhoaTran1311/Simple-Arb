@@ -9,14 +9,10 @@ class Exchange(StrEnum):
 
 @dataclass
 class BidAsk:
-    exchange: str
+    exchange: Exchange
     bid: float
     ask: float
     timestamp: float
-
-    def __str__(self):
-        return f"BidAsk(exchange={self.exchange}, bid={self.bid}, ask={self.ask}, timestamp={self.timestamp})"
-
 
 @dataclass
 class Pair:
@@ -27,4 +23,4 @@ class Pair:
     second_ticker: str  # the ticker is the unique identifier for the market on the exchange, it is also known as asset_id on Polymarket and market_ticker on Kalshi.
 
     def __str__(self):
-        return f"Pair([{self.first_exchange}] {self.first_id}, [{self.second_exchange}] {self.second_id})"
+        return f"Pair([{self.first_exchange}] {self.first_ticker}, [{self.second_exchange}] {self.second_ticker})"

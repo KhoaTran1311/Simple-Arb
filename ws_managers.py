@@ -3,6 +3,7 @@ import json
 import logging
 
 import websockets
+
 from gen_auth_headers import gen_kalshi_auth_headers
 
 
@@ -52,7 +53,7 @@ class BaseWebsocketManager:
             self.is_subscribed = False
             return False
 
-    async def _get_unsubscribe_message(self):
+    def _get_unsubscribe_message(self):
         raise NotImplementedError("Must implement _get_unsubscribe_message in subclass")
 
     async def unsubscribe(self):
@@ -61,7 +62,7 @@ class BaseWebsocketManager:
             return
 
         try:
-            unsubscribe_message = await self._get_unsubscribe_message()
+            unsubscribe_message = self._get_unsubscribe_message()
             self.logger.debug(f"Sending unsubscribe message: {unsubscribe_message}")
             await self.websocket.send(json.dumps(unsubscribe_message))
             await asyncio.sleep(0.1)  # Wait for server to process
@@ -81,6 +82,7 @@ class BaseWebsocketManager:
             return json.loads(message)
         except websockets.exceptions.ConnectionClosed:
             self.is_connected = False
+            self.is_subscribed = False
             self.logger.error(f"WebSocket already closed")
             return None
         except Exception as e:
@@ -121,7 +123,7 @@ class KalshiWebsocketManager(BaseWebsocketManager):
     url = base_url + path
 
     def __init__(self, market_ticker):
-        super().__init__("KalshiWbsckt")
+        super().__init__("KalshiWebsocket")
         self.logger.debug(f"Initializing KalshiWebsocketManager with market ticker: {market_ticker}")
         self.market_ticker = market_ticker
 
@@ -129,25 +131,22 @@ class KalshiWebsocketManager(BaseWebsocketManager):
         return gen_kalshi_auth_headers("GET", self.path)
 
     def _get_subscribe_message(self):
-        return {"id": 1, "cmd": "subscribe",
-                "params": {"channels": ["ticker"], "market_ticker": self.market_ticker}}
+        return {"id": 1, "cmd": "subscribe", "params": {"channels": ["ticker"], "market_ticker": self.market_ticker}}
 
     def _get_unsubscribe_message(self):
-        return {"id": 1, "cmd": "unsubscribe",
-                               "params": {"channels": ["ticker"], "market_ticker": self.market_ticker}}
+        return {"id": 1, "cmd": "unsubscribe", "params": {"channels": ["ticker"], "market_ticker": self.market_ticker}}
 
 
 class PolymarketWebsocketManager(BaseWebsocketManager):
     url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
     def __init__(self, assets_id):
-        super().__init__("PolyWbsckt")
-        self.logger.debug(f"Initializing PolymarketWebsocktManager with asset id: {assets_id}")
+        super().__init__("PolyWebsocket")
+        self.logger.debug(f"Initializing PolymarketWebsocketManager with asset id: {assets_id}")
         self.assets_id = assets_id
 
     def _get_subscribe_message(self):
-        return {"assets_ids": [self.assets_id], "type": "market", "custom_feature_enabled": True,
-                "initial_dump": False}
+        return {"assets_ids": [self.assets_id], "type": "market", "custom_feature_enabled": True, "initial_dump": False}
 
     def _get_unsubscribe_message(self):
         return {"operation": "unsubscribe", "assets_ids": [self.assets_id], }

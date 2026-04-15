@@ -1,7 +1,9 @@
 import logging
+from dataclasses import astuple
 from datetime import datetime
 
 import aiosqlite
+from aiosqlite import Connection
 
 from models import Pair, BidAsk
 
@@ -10,11 +12,17 @@ logger = logging.getLogger(__name__)
 
 class DatabaseService:
     def __init__(self, db_path=None):
-        self.db_path = db_path
-        self.db_conn = None
+        self.db_path: str | None = db_path
+        self.db_conn: Connection | None = None
+        self._bid_ask_buffer: list[tuple[int, BidAsk]] = []
+        self._signal_buffer: list[tuple] = []
 
     async def initialize_db(self):
         self.db_conn = await aiosqlite.connect(self.db_path)
+
+        await self.db_conn.execute("PRAGMA journal_mode=WAL")
+        await self.db_conn.execute("PRAGMA synchronous=NORMAL")
+        await self.db_conn.execute("PRAGMA foreign_keys=ON")
 
         query = """
                 CREATE TABLE IF NOT EXISTS pair
@@ -60,7 +68,7 @@ class DatabaseService:
                                    """, (first_exchange, second_exchange, first_ticker, second_ticker))
         await self.db_conn.commit()
         async with self.db_conn.execute("""
-                                        SELECT *
+                                        SELECT id, first_exchange, second_exchange, first_ticker, second_ticker
                                         FROM pair
                                         WHERE first_exchange = ?
                                           AND second_exchange = ?
@@ -71,27 +79,45 @@ class DatabaseService:
 
         return Pair(*row)
 
-    async def save_bid_ask(self, pair_id: int, bid_ask: BidAsk):
-        logger.debug(f"Save bid and ask for pair {pair_id}, value: {bid_ask}")
+    def save_bid_ask(self, pair_id: int, bid_ask: BidAsk):
+        logger.debug(f"Save to buffer bid and ask for pair {pair_id}, value: {bid_ask}")
+        self._bid_ask_buffer.append((pair_id, bid_ask))
 
-        await self.db_conn.execute("""
-                                   INSERT INTO bid_ask (pair_id, exchange, bid, ask, timestamp)
-                                   VALUES (?, ?, ?, ?, ?)
-                                   """, (pair_id, bid_ask.exchange, bid_ask.bid, bid_ask.ask, int(bid_ask.timestamp)))
-        await self.db_conn.commit()
-        logger.info(f"Finished saving bid ask")
-
-    async def save_signal(self, pair_id: int, long_price: float, short_price: float, long_exchange: str):
+    def save_signal(self, pair_id: int, long_price: float, short_price: float, long_exchange: str):
         logger.debug(
-            f"Saving signal for pair {pair_id}, long_price={long_price}, short_price={short_price}, long_exchange={long_exchange}")
+            f"Saving to buffer signal for pair {pair_id}, long_price={long_price}, short_price={short_price}, long_exchange={long_exchange}")
 
-        await self.db_conn.execute("""
-                                   INSERT INTO signal (pair_id, timestamp, long_price, short_price, long_exchange)
-                                   VALUES (?, ?, ?, ?, ?)
-                                   """,
-                                   (pair_id, int(datetime.now().timestamp()), long_price, short_price, long_exchange))
-        await self.db_conn.commit()
-        logger.info(f"Finished saving signal")
+        self._signal_buffer.append((pair_id, int(datetime.now().timestamp()), long_price, short_price, long_exchange))
+
+    async def flush_buffers(self):
+        if not self._bid_ask_buffer and not self._signal_buffer:
+            return
+
+        logger.debug(
+            f"Flushing buffers: bid_ask_size: {len(self._bid_ask_buffer)}, signal_buffer_size: {len(self._signal_buffer)}")
+
+        bid_ask_snapshot = self._bid_ask_buffer[:]
+        signal_snapshot = self._signal_buffer[:]
+        try:
+            await self.db_conn.execute("BEGIN")
+            if bid_ask_snapshot:
+                await self.db_conn.executemany("""
+                                               INSERT INTO bid_ask (pair_id, exchange, bid, ask, timestamp)
+                                               VALUES (?, ?, ?, ?, ?)
+                                               """, [(pair_id, *astuple(ba)) for pair_id, ba in bid_ask_snapshot])
+            if signal_snapshot:
+                await self.db_conn.executemany("""
+                                               INSERT INTO signal (pair_id, timestamp, long_price, short_price, long_exchange)
+                                               VALUES (?, ?, ?, ?, ?)
+                                               """, signal_snapshot)
+            await self.db_conn.commit()
+        except Exception as e:
+            logger.error(f"Failed to flush buffers: {e}")
+            await self.db_conn.rollback()
+            return
+
+        self._bid_ask_buffer.clear()
+        self._signal_buffer.clear()
 
     async def close_db(self):
         if self.db_conn:
