@@ -16,14 +16,13 @@ load_dotenv(verbose=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s.%(msecs)03d [%(levelname)s] -- %(name)s/%(funcName)s:%(lineno)d -- %(message)s",
-    datefmt="%m/%d/%y %H:%M:%S",
+    filename='./logs/similar.log', filemode='a', datefmt="%m/%d/%y %H:%M:%S",
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("find_similar_markets")
 
 KAL_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 POL_BASE_URL = "https://gamma-api.polymarket.com"
-MODEL_NAME = "all-mpnet-base-v2"
 
 
 def _fetch_paginated(
@@ -171,7 +170,7 @@ def save_match(
 
 
 def main(
-    event_k: int, event_thres: float, market_k: int, market_thres: float, db_path: str
+    event_k: int, event_thres: float, market_k: int, market_thres: float, db_path: str, model_name: str
 ):
     conn = setup_db(db_path)
     logger.info(f"Database ready at {db_path}")
@@ -184,8 +183,8 @@ def main(
     pol_events = fetch_polymarket_events()
     logger.info(f"Fetched {len(pol_events)} Polymarket events")
 
-    logger.info(f"Loading model: {MODEL_NAME}")
-    model = SentenceTransformer(MODEL_NAME, trust_remote_code=True)
+    logger.info(f"Loading model: {model_name}")
+    model = SentenceTransformer(model_name, trust_remote_code=True)
 
     kal_titles = [e["title"] for e in kal_events]
     pol_titles = [e["title"] for e in pol_events]
@@ -197,6 +196,8 @@ def main(
     logger.info(
         f"Found {len(similar_events)} Polymarket events with similar Kalshi counterparts"
     )
+
+    num_sim_markets = 0
 
     for pol_idx, matches in similar_events.items():
         pol_markets = pol_events[pol_idx].get("markets", [])
@@ -252,13 +253,16 @@ def main(
 
             best_kal_m_idx, best_score = kal_sim[0]
             best_kal_title = kal_market_records[best_kal_m_idx]["title"]
-            logger.info(
+            logger.debug(
                 f"Found {len(kal_sim)} similar market(s), best score={best_score:.3f} "
                 f"('{best_kal_title}') for '{pol_market['question']}'"
             )
+            num_sim_markets += len(kal_sim)
             for kal_m_idx, score in kal_sim:
                 rec = kal_market_records[kal_m_idx]
                 save_match(conn, rec["ticker"], pol_asset_id, score, rec, pol_market)
+
+    logger.info(f"Found {num_sim_markets} similar markets. ")
 
 
 if __name__ == "__main__":
@@ -295,6 +299,13 @@ if __name__ == "__main__":
         default="similar_markets.db",
         help="Path to SQLite database for saving matches (default: similar_markets.db)",
     )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="all-mpnet-base-v2",
+        help="SentenceTransformer model name or path (default: all-mpnet-base-v2)",
+    )
 
     args = parser.parse_args()
-    main(args.event_k, args.event_thres, args.market_k, args.market_thres, args.db)
+
+    main(args.event_k, args.event_thres, args.market_k, args.market_thres, args.db, args.model)
