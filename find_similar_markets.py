@@ -11,15 +11,18 @@ from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
-from gen_auth_headers import gen_kalshi_auth_headers
-
 load_dotenv(verbose=True)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s.%(msecs)03d [%(levelname)s] -- %(name)s/%(funcName)s:%(lineno)d -- %(message)s",
-    filename='./logs/similar.log', filemode='a', datefmt="%m/%d/%y %H:%M:%S",
-)
+_fmt = "%(asctime)s.%(msecs)03d [%(levelname)s] -- %(name)s/%(funcName)s:%(lineno)d -- %(message)s"
+_datefmt = "%m/%d/%y %H:%M:%S"
+
+_file_handler = logging.FileHandler("./logs/similar.log", mode="a")
+_file_handler.setFormatter(logging.Formatter(_fmt, datefmt=_datefmt))
+
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(logging.Formatter(_fmt, datefmt=_datefmt))
+
+logging.basicConfig(level=logging.INFO, handlers=[_file_handler, _console_handler])
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("find_similar_markets")
 
@@ -27,28 +30,43 @@ KAL_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 POL_BASE_URL = "https://gamma-api.polymarket.com"
 
 
+BASE_RETRY_DELAY = 1
+MAX_RETRY_DELAY = 60
+
+
 async def _fetch_paginated(
-        base_url: str, path:str, limit: int,
+        base_url: str, path: str, limit: int,
         build_params: Callable[[Optional[str]], dict],
-        get_next_cursor: Callable[[dict], str],
+        get_items: Callable[[any], list],
+        get_next_cursor: Callable[[any], Optional[str]],
         auth_headers: dict = None,
 ):
-    all_events = []
-
+    all_items = []
     cursor = None
+
     async with aiohttp.ClientSession(headers=auth_headers) as session:
         while True:
             params = build_params(cursor)
-            async with session.get(base_url + path, params=params) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
+            attempt = 0
+            while True:
+                try:
+                    async with session.get(base_url + path, params=params) as resp:
+                        resp.raise_for_status()
+                        data = await resp.json()
+                    break
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    delay = min(BASE_RETRY_DELAY * (2 ** attempt), MAX_RETRY_DELAY)
+                    logger.warning(f"Fetch error ({e}), retrying in {delay}s...")
+                    await asyncio.sleep(delay)
+                    attempt += 1
 
-            events = data.get("events", [])
-            all_events.extend(events)
+            items = get_items(data)
+            all_items.extend(items)
             cursor = get_next_cursor(data)
-            if not cursor or len(events) < limit:
+            if not cursor or len(items) < limit:
                 break
-    return all_events
+
+    return all_items
 
 
 async def fetch_kalshi_events() -> list[dict]:
@@ -62,10 +80,9 @@ async def fetch_kalshi_events() -> list[dict]:
             "with_nested_markets": "true",
             **({"cursor": cursor} if cursor else {}),
         },
+        get_items=lambda data: data.get("events", []),
         get_next_cursor=lambda data: data.get("cursor"),
-        auth_headers=gen_kalshi_auth_headers("GET", path)
     )
-
     logger.info(f"Fetched {len(res)} Kalshi events")
     return res
 
@@ -79,9 +96,9 @@ async def fetch_polymarket_events() -> list[dict]:
             "limit": limit,
             **({"after_cursor": cursor} if cursor else {}),
         },
+        get_items=lambda data: data.get("events", []),
         get_next_cursor=lambda data: data.get("next_cursor"),
     )
-
     logger.info(f"Fetched {len(res)} Polymarket events")
     return res
 
@@ -178,7 +195,6 @@ def save_match(
             float(pol_market["volume24hr"]) if pol_market.get("volume24hr") else None,
         ),
     )
-    conn.commit()
 
 
 async def main(
@@ -211,72 +227,77 @@ async def main(
 
     num_sim_markets = 0
 
-    for pol_idx, matches in tqdm(similar_events.items(), desc="Similar markets"):
-        pol_markets = pol_events[pol_idx].get("markets", [])
-        if not pol_markets:
-            continue
+    try:
+        for pol_idx, matches in tqdm(similar_events.items(), desc="Similar markets"):
+            pol_markets = pol_events[pol_idx].get("markets", [])
+            if not pol_markets:
+                continue
 
-        kal_market_records = []
-        for kal_idx, event_score in matches:
-            event = kal_events[kal_idx]
-            for market_idx, market in enumerate(event.get("markets", [])):
-                if market.get("status", "") != "active":
-                    continue
+            kal_market_records = []
+            for kal_idx, event_score in matches:
+                event = kal_events[kal_idx]
+                for market_idx, market in enumerate(event.get("markets", [])):
+                    if market.get("status", "") != "active":
+                        continue
 
-                kal_market_records.append(
-                    {
-                        "event_idx": kal_idx,
-                        "event_title": event["title"],
-                        "event_score": event_score,
-                        "market_idx": market_idx,
-                        "title": market.get("title", ""),
-                        "rules_primary": market.get("rules_primary", ""),
-                        "rules_secondary": market.get("rules_secondary", ""),
-                        "ticker": market.get("ticker", ""),
-                        "expected_expiration_time": market.get(
-                            "expected_expiration_time"
-                        ),
-                        "updated_time": market.get("updated_time"),
-                        "volume_fp": market.get("volume_fp"),
-                        "volume_24h_fp": market.get("volume_24h_fp"),
-                    }
-                )
+                    kal_market_records.append(
+                        {
+                            "event_idx": kal_idx,
+                            "event_title": event["title"],
+                            "event_score": event_score,
+                            "market_idx": market_idx,
+                            "title": market.get("title", ""),
+                            "rules_primary": market.get("rules_primary", ""),
+                            "rules_secondary": market.get("rules_secondary", ""),
+                            "ticker": market.get("ticker", ""),
+                            "expected_expiration_time": market.get("expected_expiration_time"),
+                            "updated_time": market.get("updated_time"),
+                            "volume_fp": market.get("volume_fp"),
+                            "volume_24h_fp": market.get("volume_24h_fp"),
+                        }
+                    )
 
-        if not kal_market_records:
-            continue
+            if not kal_market_records:
+                continue
 
-        active_pol_markets = [m for m in pol_markets if m["active"] and not m["closed"]]
-        pol_markets_desc = [
-            f"{m['question']}\n\n{m['description']}" for m in active_pol_markets
-        ]
-        kal_markets_desc = [
-            f"{r['title']}\n\n{r['rules_primary']}\n\n{r['rules_secondary']}"
-            for r in kal_market_records
-        ]
+            active_pol_markets = [m for m in pol_markets if m["active"] and not m["closed"]]
+            pol_markets_desc = [
+                f"{m['question']}\n\n{m['description']}" for m in active_pol_markets
+            ]
+            kal_markets_desc = [
+                f"{r['title']}\n\n{r['rules_primary']}\n\n{r['rules_secondary']}"
+                for r in kal_market_records
+            ]
 
-        similar_markets = sim_search(
-            model, pol_markets_desc, kal_markets_desc, k=market_k, thres=market_thres,
-            col1_encode_args={"task": "retrieval", "prompt_name": "query"},
-            col2_encode_args={"task": "retrieval", "prompt_name": "passage"}
-        )
-
-        for pol_m_idx, kal_sim in similar_markets.items():
-            pol_market = active_pol_markets[pol_m_idx]
-            clob_ids = json.loads(pol_market.get("clobTokenIds", "[]"))
-            pol_asset_id = clob_ids[0] if clob_ids else "N/A"
-
-            best_kal_m_idx, best_score = kal_sim[0]
-            best_kal_title = kal_market_records[best_kal_m_idx]["title"]
-            logger.debug(
-                f"Found {len(kal_sim)} similar market(s), best score={best_score:.3f} "
-                f"('{best_kal_title}') for '{pol_market['question']}'"
+            similar_markets = sim_search(
+                model, pol_markets_desc, kal_markets_desc, k=market_k, thres=market_thres,
+                col1_encode_args={"task": "retrieval", "prompt_name": "query"},
+                col2_encode_args={"task": "retrieval", "prompt_name": "document"}
             )
-            num_sim_markets += len(kal_sim)
-            for kal_m_idx, score in kal_sim:
-                rec = kal_market_records[kal_m_idx]
-                save_match(conn, rec["ticker"], pol_asset_id, score, rec, pol_market)
 
-    logger.info(f"Found {num_sim_markets} similar markets. ")
+            for pol_m_idx, kal_sim in similar_markets.items():
+                pol_market = active_pol_markets[pol_m_idx]
+                clob_ids = json.loads(pol_market.get("clobTokenIds", "[]"))
+                pol_asset_id = clob_ids[0] if clob_ids else "N/A"
+
+                best_kal_m_idx, best_score = kal_sim[0]
+                best_kal_title = kal_market_records[best_kal_m_idx]["title"]
+                logger.debug(
+                    f"Found {len(kal_sim)} similar market(s), best score={best_score:.3f} "
+                    f"('{best_kal_title}') for '{pol_market['question']}'"
+                )
+                num_sim_markets += len(kal_sim)
+                for kal_m_idx, score in kal_sim:
+                    rec = kal_market_records[kal_m_idx]
+                    save_match(conn, rec["ticker"], pol_asset_id, score, rec, pol_market)
+
+            conn.commit()
+
+    finally:
+        conn.commit()
+        conn.close()
+
+    logger.info(f"Found {num_sim_markets} similar markets.")
 
 
 if __name__ == "__main__":
