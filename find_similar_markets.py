@@ -1,13 +1,15 @@
 import argparse
+import asyncio
 import json
 import logging
 import sqlite3
 from typing import Callable, Optional
 
+import aiohttp
 import numpy as np
-import requests
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
+from tqdm import tqdm
 
 from gen_auth_headers import gen_kalshi_auth_headers
 
@@ -25,7 +27,7 @@ KAL_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 POL_BASE_URL = "https://gamma-api.polymarket.com"
 
 
-def _fetch_paginated(
+async def _fetch_paginated(
         base_url: str, path:str, limit: int,
         build_params: Callable[[Optional[str]], dict],
         get_next_cursor: Callable[[dict], str],
@@ -34,46 +36,54 @@ def _fetch_paginated(
     all_events = []
 
     cursor = None
-    while True:
-        params = build_params(cursor)
-        resp = requests.get(base_url + path, headers=auth_headers, params=params)
-        resp.raise_for_status()
-        data = resp.json()
-        events = data.get("events", [])
-        all_events.extend(events)
-        cursor = get_next_cursor(data)
-        if not cursor or len(events) < limit:
-            break
+    async with aiohttp.ClientSession(headers=auth_headers) as session:
+        while True:
+            params = build_params(cursor)
+            async with session.get(base_url + path, params=params) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+
+            events = data.get("events", [])
+            all_events.extend(events)
+            cursor = get_next_cursor(data)
+            if not cursor or len(events) < limit:
+                break
     return all_events
 
 
-def fetch_kalshi_events() -> list[dict]:
+async def fetch_kalshi_events() -> list[dict]:
     limit = 200
     path = "/events"
-    return _fetch_paginated(
+    res = await _fetch_paginated(
         KAL_BASE_URL, path, limit=limit,
         build_params=lambda cursor: {
             "status": "open",
             "limit": limit,
-            "with_nested_markets": True,
+            "with_nested_markets": "true",
             **({"cursor": cursor} if cursor else {}),
         },
         get_next_cursor=lambda data: data.get("cursor"),
         auth_headers=gen_kalshi_auth_headers("GET", path)
     )
 
+    logger.info(f"Fetched {len(res)} Kalshi events")
+    return res
 
-def fetch_polymarket_events() -> list[dict]:
+
+async def fetch_polymarket_events() -> list[dict]:
     limit = 500
-    return _fetch_paginated(
+    res = await _fetch_paginated(
         POL_BASE_URL, "/events/keyset", limit=limit,
         build_params=lambda cursor: {
-            "closed": False,
+            "closed": "false",
             "limit": limit,
             **({"after_cursor": cursor} if cursor else {}),
         },
         get_next_cursor=lambda data: data.get("next_cursor"),
     )
+
+    logger.info(f"Fetched {len(res)} Polymarket events")
+    return res
 
 
 def sim_search(
@@ -82,6 +92,8 @@ def sim_search(
     collection2: list[str],
     k: int = 3,
     thres: float = 0.8,
+    col1_encode_args: dict = None,
+    col2_encode_args: dict = None,
 ) -> dict[int, list[tuple[int, float]]]:
     """Return top-k matches from collection2 for each item in collection1 above thres."""
     if not collection1 or not collection2:
@@ -89,8 +101,8 @@ def sim_search(
 
     k = min(k, len(collection2))
 
-    col1_embds = model.encode(collection1, normalize_embeddings=True)
-    col2_embds = model.encode(collection2, normalize_embeddings=True)
+    col1_embds = model.encode(collection1, normalize_embeddings=True, show_progress_bar=False, **(col1_encode_args or {}))
+    col2_embds = model.encode(collection2, normalize_embeddings=True, show_progress_bar=False, **(col2_encode_args or {}))
 
     similarities = col1_embds @ col2_embds.T
 
@@ -169,29 +181,29 @@ def save_match(
     conn.commit()
 
 
-def main(
+async def main(
     event_k: int, event_thres: float, market_k: int, market_thres: float, db_path: str, model_name: str
 ):
     conn = setup_db(db_path)
     logger.info(f"Database ready at {db_path}")
 
-    logger.info("Fetching Kalshi events...")
-    kal_events = fetch_kalshi_events()
-    logger.info(f"Fetched {len(kal_events)} Kalshi events")
+    logger.info("Starting fetching...")
+    kal_events, pol_events = await asyncio.gather(fetch_kalshi_events(), fetch_polymarket_events())
+    logger.info("Finished fetching events")
 
-    logger.info("Fetching Polymarket events...")
-    pol_events = fetch_polymarket_events()
-    logger.info(f"Fetched {len(pol_events)} Polymarket events")
 
     logger.info(f"Loading model: {model_name}")
     model = SentenceTransformer(model_name, trust_remote_code=True)
+    logger.info(f"Finished loaded {model_name}")
 
     kal_titles = [e["title"] for e in kal_events]
     pol_titles = [e["title"] for e in pol_events]
 
     logger.info(f"Running event-level similarity (k={event_k}, thres={event_thres})...")
     similar_events = sim_search(
-        model, pol_titles, kal_titles, k=event_k, thres=event_thres
+        model, pol_titles, kal_titles, k=event_k, thres=event_thres,
+        col1_encode_args={"task": "text-matching"},
+        col2_encode_args={"task": "text-matching"}
     )
     logger.info(
         f"Found {len(similar_events)} Polymarket events with similar Kalshi counterparts"
@@ -199,7 +211,7 @@ def main(
 
     num_sim_markets = 0
 
-    for pol_idx, matches in similar_events.items():
+    for pol_idx, matches in tqdm(similar_events.items(), desc="Similar markets"):
         pol_markets = pol_events[pol_idx].get("markets", [])
         if not pol_markets:
             continue
@@ -243,7 +255,9 @@ def main(
         ]
 
         similar_markets = sim_search(
-            model, pol_markets_desc, kal_markets_desc, k=market_k, thres=market_thres
+            model, pol_markets_desc, kal_markets_desc, k=market_k, thres=market_thres,
+            col1_encode_args={"task": "retrieval", "prompt_name": "query"},
+            col2_encode_args={"task": "retrieval", "prompt_name": "passage"}
         )
 
         for pol_m_idx, kal_sim in similar_markets.items():
@@ -302,10 +316,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model",
         type=str,
-        default="all-mpnet-base-v2",
-        help="SentenceTransformer model name or path (default: all-mpnet-base-v2)",
+        default="jinaai/jina-embeddings-v5-text-nano",
+        help="SentenceTransformer model name or path (default: jinaai/jina-embeddings-v5-text-nano)",
     )
 
     args = parser.parse_args()
 
-    main(args.event_k, args.event_thres, args.market_k, args.market_thres, args.db, args.model)
+    asyncio.run(main(args.event_k, args.event_thres, args.market_k, args.market_thres, args.db, args.model))
