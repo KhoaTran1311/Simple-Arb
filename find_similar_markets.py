@@ -26,12 +26,14 @@ logging.basicConfig(level=logging.INFO, handlers=[_file_handler, _console_handle
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("find_similar_markets")
 
+
 KAL_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 POL_BASE_URL = "https://gamma-api.polymarket.com"
 
-
 BASE_RETRY_DELAY = 1
 MAX_RETRY_DELAY = 60
+MAX_RETRY_ATTEMPTS = 10
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
 
 
 async def _fetch_paginated(
@@ -44,21 +46,23 @@ async def _fetch_paginated(
     all_items = []
     cursor = None
 
-    async with aiohttp.ClientSession(headers=auth_headers) as session:
+    async with aiohttp.ClientSession(headers=auth_headers, timeout=REQUEST_TIMEOUT) as session:
         while True:
             params = build_params(cursor)
             attempt = 0
-            while True:
+            while attempt < MAX_RETRY_ATTEMPTS:
                 try:
                     async with session.get(base_url + path, params=params) as resp:
                         resp.raise_for_status()
                         data = await resp.json()
                     break
                 except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                    delay = min(BASE_RETRY_DELAY * (2 ** attempt), MAX_RETRY_DELAY)
-                    logger.warning(f"Fetch error ({e}), retrying in {delay}s...")
-                    await asyncio.sleep(delay)
                     attempt += 1
+                    if attempt >= MAX_RETRY_ATTEMPTS:
+                        raise RuntimeError(f"Exceeded {MAX_RETRY_ATTEMPTS} retries for {base_url + path}") from e
+                    delay = min(BASE_RETRY_DELAY * (2 ** attempt), MAX_RETRY_DELAY)
+                    logger.warning(f"Fetch error ({e}), retrying in {delay}s... (attempt {attempt}/{MAX_RETRY_ATTEMPTS})")
+                    await asyncio.sleep(delay)
 
             items = get_items(data)
             all_items.extend(items)
