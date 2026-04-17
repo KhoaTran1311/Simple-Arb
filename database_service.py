@@ -1,6 +1,7 @@
 import logging
 from dataclasses import astuple
 from datetime import datetime
+from decimal import Decimal
 
 import aiosqlite
 from aiosqlite import Connection
@@ -83,7 +84,7 @@ class DatabaseService:
         logger.debug(f"Save to buffer bid and ask for pair {pair_id}, value: {bid_ask}")
         self._bid_ask_buffer.append((pair_id, bid_ask))
 
-    def save_signal(self, pair_id: int, long_price: float, short_price: float, long_exchange: str):
+    def save_signal(self, pair_id: int, long_price: Decimal, short_price: Decimal, long_exchange: str):
         logger.debug(
             f"Saving to buffer signal for pair {pair_id}, long_price={long_price}, short_price={short_price}, long_exchange={long_exchange}")
 
@@ -116,8 +117,8 @@ class DatabaseService:
             await self.db_conn.rollback()
             return
 
-        self._bid_ask_buffer.clear()
-        self._signal_buffer.clear()
+        del self._bid_ask_buffer[:len(bid_ask_snapshot)]
+        del self._signal_buffer[:len(signal_snapshot)]
 
     async def close_db(self):
         if self.db_conn:

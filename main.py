@@ -5,11 +5,19 @@ from datetime import datetime
 
 from database_service import DatabaseService
 from models import BidAsk, Pair, Exchange
+from orderbook import Orderbook
 from ws_managers import KalshiWebsocketManager, PolymarketWebsocketManager
 
-logging.basicConfig(level=logging.DEBUG,
-                    format='%(asctime)s.%(msecs)03d [%(levelname)s] -- %(name)s/%(funcName)s:%(lineno)d -- %(message)s',
-                    filename='./logs/app.log', filemode='a', datefmt="%m/%d/%y %H:%M:%S")
+_fmt = "%(asctime)s.%(msecs)03d [%(levelname)s] -- %(name)s/%(funcName)s:%(lineno)d -- %(message)s"
+_datefmt = "%m/%d/%y %H:%M:%S"
+
+_file_handler = logging.FileHandler("./logs/app.log", mode="a")
+_file_handler.setFormatter(logging.Formatter(_fmt, datefmt=_datefmt))
+
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(logging.Formatter(_fmt, datefmt=_datefmt))
+
+logging.basicConfig(level=logging.INFO, handlers=[_file_handler, _console_handler])
 
 kalshi_logger = logging.getLogger("kalshi")
 polymarket_logger = logging.getLogger("polymarket")
@@ -20,7 +28,7 @@ BASE_RETRY_DELAY = 1  # second
 MAX_RETRY_DELAY = 60  # second
 
 
-async def kalshi_websocket(db_service: DatabaseService, market_pair: Pair, queue: asyncio.Queue):
+async def kalshi_websocket(db_service: DatabaseService, market_pair: Pair, queue: asyncio.Queue, book: Orderbook):
     attempt = 0
     while True:
         try:
@@ -33,14 +41,19 @@ async def kalshi_websocket(db_service: DatabaseService, market_pair: Pair, queue
 
                     msg_type = data.get("type")
 
-                    if msg_type == "ticker":
-                        kalshi_logger.debug(f"Received best_bid_ask: {data}")
-                        bid_ask = BidAsk(exchange=Exchange.KALSHI, bid=float(data["msg"]["yes_bid_dollars"]),
-                                         ask=float(data["msg"]["yes_ask_dollars"]),
-                                         timestamp=datetime.now().timestamp())
-                        await queue.put(bid_ask)
-                        db_service.save_bid_ask(market_pair.id, bid_ask)
-
+                    if msg_type == "orderbook_snapshot":
+                        book.populate_kalshi(data['msg'])
+                    elif msg_type == "orderbook_delta":
+                        kalshi_logger.debug(f"Received new orderbook delta: {data['msg']}")
+                        book.delta_kalshi(data['msg'])
+                        await queue.put(Exchange.KALSHI)
+                    # elif msg_type == "ticker":
+                    #     kalshi_logger.debug(f"Received best_bid_ask: {data}")
+                    #     bid_ask = BidAsk(exchange=Exchange.KALSHI, bid=float(data["msg"]["yes_bid_dollars"]),
+                    #                      ask=float(data["msg"]["yes_ask_dollars"]),
+                    #                      timestamp=datetime.now().timestamp())
+                    #     await queue.put(bid_ask)
+                    #     db_service.save_bid_ask(market_pair.id, bid_ask)
                     elif msg_type == "error":
                         kalshi_logger.error(data)
         except asyncio.CancelledError:
@@ -55,7 +68,7 @@ async def kalshi_websocket(db_service: DatabaseService, market_pair: Pair, queue
         attempt += 1
 
 
-async def polymarket_websocket(db_service: DatabaseService, market_pair: Pair, queue: asyncio.Queue):
+async def polymarket_websocket(db_service: DatabaseService, market_pair: Pair, queue: asyncio.Queue, book: Orderbook):
     attempt = 0
     while True:
         try:
@@ -66,15 +79,22 @@ async def polymarket_websocket(db_service: DatabaseService, market_pair: Pair, q
                     if data is None:
                         break
 
+                    if isinstance(data, list):
+                        book.populate_polymarket(data[0])
+                        continue
+
                     msg_type = data.get("event_type")
 
-                    if msg_type == "best_bid_ask":
-                        polymarket_logger.debug(f"Received best_bid_ask: {data}")
-                        bid_ask = BidAsk(exchange=Exchange.POLYMARKET, bid=float(data["best_bid"]),
-                                         ask=float(data["best_ask"]), timestamp=datetime.now().timestamp())
-                        await queue.put(bid_ask)
-                        db_service.save_bid_ask(market_pair.id, bid_ask)
-
+                    if msg_type == "price_change":
+                        polymarket_logger.debug(f"Received new orderbook delta: {data['price_changes']}")
+                        book.delta_polymarket(data['price_changes'])
+                        await queue.put(Exchange.POLYMARKET)
+                    # elif msg_type == "best_bid_ask":
+                    #     polymarket_logger.debug(f"Received best_bid_ask: {data}")
+                    #     bid_ask = BidAsk(exchange=Exchange.POLYMARKET, bid=float(data["best_bid"]),
+                    #                      ask=float(data["best_ask"]), timestamp=datetime.now().timestamp())
+                    #     await queue.put(bid_ask)
+                    #     db_service.save_bid_ask(market_pair.id, bid_ask)
                     elif msg_type == "error":
                         polymarket_logger.error(data)
         except asyncio.CancelledError:
@@ -89,44 +109,62 @@ async def polymarket_websocket(db_service: DatabaseService, market_pair: Pair, q
         attempt += 1
 
 
-async def compare_exchanges(db_service: DatabaseService, market_pair: Pair, queue, threshold=0.01, stale_limit=30):
+async def compare_exchanges(
+        db_service: DatabaseService, market_pair: Pair, queue, books: dict[Exchange, Orderbook],
+        threshold=0.01, stale_limit=30
+):
     compare_logger.debug(f"Running with threshold: {threshold}, stale_limit: {stale_limit} seconds")
-    first_bid_ask = None
-    second_bid_ask = None
+    first_bid = None
+    first_ask = None
+    second_bid = None
+    second_ask = None
+    collected_market = None
+
     try:
         while True:
-            bid_ask: BidAsk = await queue.get()
-            if bid_ask.exchange == Exchange.KALSHI:  # TODO: this is stupid code. Refactor to allow more exchanges.
-                first_bid_ask = bid_ask
-            else:
-                second_bid_ask = bid_ask
+            market_w_update = await queue.get()
+            collected_market = market_w_update if collected_market is None else collected_market
+            # bid_ask: BidAsk = await queue.get()
+            # if bid_ask.exchange == Exchange.KALSHI:  # TODO: this is stupid code. Refactor to allow more exchanges.
+            #     first_bid_ask = bid_ask
+            # else:
+            #     second_bid_ask = bid_ask
 
-            if first_bid_ask and second_bid_ask:
-                if abs(first_bid_ask.timestamp - second_bid_ask.timestamp) > stale_limit:
-                    compare_logger.warning(
-                        f"Data may be stale, skipping comparison. first_bid_ask={first_bid_ask}, second_bid_ask={second_bid_ask}")
-                    if first_bid_ask.timestamp < second_bid_ask.timestamp:
-                        first_bid_ask = None
-                    else:
-                        second_bid_ask = None
+            if collected_market != market_w_update:
+                first_exchange = collected_market
+                second_exchange = market_w_update
+                first_bid = books[first_exchange].best_bid()
+                first_ask = books[first_exchange].best_ask()
+                second_bid = books[second_exchange].best_bid()
+                second_ask = books[second_exchange].best_ask()
+                collected_market = None
 
-                    continue
+                if first_bid and first_ask and second_bid and second_ask:
+                    # if abs(first_bid_ask.timestamp - second_bid_ask.timestamp) > stale_limit:
+                    #     compare_logger.warning(
+                    #         f"Data may be stale, skipping comparison. first_bid_ask={first_bid_ask}, second_bid_ask={second_bid_ask}")
+                    #     if first_bid_ask.timestamp < second_bid_ask.timestamp:
+                    #         first_bid_ask = None
+                    #     else:
+                    #         second_bid_ask = None
+                    #
+                    #     continue
 
-                first_long_spread = second_bid_ask.bid - first_bid_ask.ask
-                second_long_spread = first_bid_ask.bid - second_bid_ask.ask
+                    first_long_spread = second_bid - first_ask
+                    second_long_spread = first_bid - second_ask
 
-                if first_long_spread > threshold or second_long_spread > threshold:
-                    compare_logger.info(f"Arbitrage opportunity found")
-                    if first_long_spread > threshold:
-                        long_price = first_bid_ask.ask
-                        short_price = second_bid_ask.bid
-                        long_exchange = Exchange.KALSHI
-                    else:
-                        long_price = second_bid_ask.ask
-                        short_price = first_bid_ask.bid
-                        long_exchange = Exchange.POLYMARKET
+                    if first_long_spread > threshold or second_long_spread > threshold:
+                        compare_logger.info(f"Arbitrage opportunity found")
+                        if first_long_spread > threshold:
+                            long_price = first_ask
+                            short_price = second_bid
+                            long_exchange = first_exchange
+                        else:
+                            long_price = second_ask
+                            short_price = first_bid
+                            long_exchange = second_exchange
 
-                    db_service.save_signal(market_pair.id, long_price, short_price, long_exchange)
+                        db_service.save_signal(market_pair.id, long_price, short_price, long_exchange)
 
     except asyncio.CancelledError:
         compare_logger.warning("Task cancelled")
@@ -151,12 +189,19 @@ async def main(db_service: DatabaseService, first_ticker: str, second_ticker: st
     await db_service.initialize_db()
     market_pair = await db_service.get_or_create_pair(Exchange.KALSHI, Exchange.POLYMARKET, first_ticker, second_ticker)
 
+    book_kalshi = Orderbook()
+    book_poly = Orderbook(second_ticker)
+
     queue = asyncio.Queue()
     tasks = [
-        asyncio.create_task(kalshi_websocket(db_service, market_pair, queue)),
-        asyncio.create_task(polymarket_websocket(db_service, market_pair, queue)),
+        asyncio.create_task(kalshi_websocket(db_service, market_pair, queue, book_kalshi)),
+        asyncio.create_task(polymarket_websocket(db_service, market_pair, queue, book_poly)),
         asyncio.create_task(
-            compare_exchanges(db_service, market_pair, queue, threshold=threshold, stale_limit=stale_limit)
+            compare_exchanges(
+                db_service, market_pair, queue,
+                {Exchange.KALSHI: book_kalshi, Exchange.POLYMARKET: book_poly},
+                threshold=threshold, stale_limit=stale_limit
+            )
         ),
         asyncio.create_task(flush_buffers_periodically(db_service, interval=flush_interval))
     ]

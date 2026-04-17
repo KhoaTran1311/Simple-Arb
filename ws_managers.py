@@ -109,7 +109,8 @@ class BaseWebsocketManager:
     async def __aenter__(self):
         if not await self.connect():
             raise ConnectionError("Failed to connect to WebSocket")
-        await self.subscribe()
+        if not await self.subscribe():
+            raise ConnectionError("Failed to subscribe to WebSocket")
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -131,10 +132,24 @@ class KalshiWebsocketManager(BaseWebsocketManager):
         return gen_kalshi_auth_headers("GET", self.path)
 
     def _get_subscribe_message(self):
-        return {"id": 1, "cmd": "subscribe", "params": {"channels": ["ticker"], "market_ticker": self.market_ticker}}
+        return {
+            "id": 1,
+            "cmd": "subscribe",
+            "params": {
+                "channels": ["orderbook_delta"],
+                "market_ticker": self.market_ticker
+            }
+        }
 
     def _get_unsubscribe_message(self):
-        return {"id": 1, "cmd": "unsubscribe", "params": {"channels": ["ticker"], "market_ticker": self.market_ticker}}
+        return {
+            "id": 1,
+            "cmd": "unsubscribe",
+            "params": {
+                "channels": ["orderbook_delta"],
+                "market_ticker": self.market_ticker
+            }
+        }
 
 
 class PolymarketWebsocketManager(BaseWebsocketManager):
@@ -146,7 +161,12 @@ class PolymarketWebsocketManager(BaseWebsocketManager):
         self.assets_id = assets_id
 
     def _get_subscribe_message(self):
-        return {"assets_ids": [self.assets_id], "type": "market", "custom_feature_enabled": True, "initial_dump": False}
+        return {
+            "assets_ids": [self.assets_id],
+            "type": "market",
+            "custom_feature_enabled": False,
+            "initial_dump": True
+        }
 
     def _get_unsubscribe_message(self):
         return {"operation": "unsubscribe", "assets_ids": [self.assets_id], }
